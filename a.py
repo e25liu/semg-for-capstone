@@ -1,169 +1,223 @@
+"""
+sEMG muscle-fatigue analysis using labelled throw times, plus a detector that is
+scored against those labels so it can be reused on other people's recordings.
+
+Pipeline: remove DC offset -> anti-aliasing low-pass -> Butterworth band-pass
+          -> (optional 60 Hz notch) -> envelope for detection
+Features per throw: MDF, MNF, RMS from the band-passed (not rectified) signal.
+Fatigue = MDF and MNF falling across throws, usually with RMS rising.
+"""
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import butter, sosfiltfilt, welch
+from scipy.signal import butter, sosfiltfilt, iirnotch, filtfilt, welch, find_peaks
+from scipy.stats import linregress
 
-# ---------- Settings ----------
+# ================= Settings =================
 FILE = "sEMG&IMU_Oct_21.xlsx"
+AA_CUTOFF = 500                 # Hz, anti-aliasing low-pass (capped below Nyquist)
+LOW, HIGH, ORDER = 20, 450, 4   # Hz, Butterworth band-pass (fine at 2000 Hz sampling)
+NOTCH_60 = False                # True if the spectrum shows a 60 Hz spike
+ENV_HZ = 10                     # envelope smoothing (Hz)
 
-# start time (HH:MM:SS) and length in seconds for each throw
-THROWS = {
-    "Throw 1": ("18:17:43", 5),
-    "Throw 2": ("18:30:44", 3),
-}
+# Labelled events: (name, start, end) as MM:SS elapsed from the start of the recording.
+# "Throw ..." entries are used for the fatigue trend; MVCs are used only as a reference.
+LABELS = [
+    ("Throw 2",  "16:59", "17:04"), ("Throw 3",  "17:43", "17:48"),
+    ("Throw 4",  "18:16", "18:21"), ("Throw 5",  "18:59", "19:05"),
+    ("Throw 6",  "20:03", "20:08"), ("Throw 7",  "20:52", "20:56"),
+    ("Throw 8",  "21:19", "21:25"), ("Throw 9",  "22:13", "22:19"),
+    ("Throw 10", "22:44", "22:50"), ("Throw 11", "23:25", "23:32"),
+    ("Throw 12", "23:44", "23:47"), ("Throw 13", "24:25", "24:28"),
+    ("Throw 14", "24:50", "24:54"), ("Throw 15", "25:24", "25:29"),
+    ("Throw 16", "25:46", "25:50"), ("Throw 17", "26:22", "26:27"),
+    ("Throw 18", "26:52", "26:56"), ("Throw 19", "27:24", "27:28"),
+    ("Throw 20", "27:46", "27:50"), ("Throw 21", "28:32", "28:38"),
+    ("Throw 22", "29:11", "29:15"), ("MVC 2",    "29:35", "29:50"),
+    ("Throw 23", "30:44", "30:47"), ("Throw 24", "31:08", "31:11"),
+    ("Throw 25", "32:53", "32:55"), ("Throw 26", "33:34", "33:39"),
+    ("MVC 3",    "34:13", "34:21"),
+]
 
-LOW, HIGH, ORDER = 20, 400, 4     # Butterworth band-pass (Hz)
-WIN_S, STEP_S = 1.0, 0.25         # sliding window for MDF/MNF over time (s)
-DROP_PCT = 5.0                    # rough rule of thumb for the verdict (not a standard)
-COLORS = {"Throw 1": "tab:blue", "Throw 2": "tab:red"}
+TOL_S = 2.0                     # a detection counts as a hit within this many seconds of a label
 
 
-def to_sec(s):
-    h, m, x = str(s).strip().split(":")
-    return int(h) * 3600 + int(m) * 60 + float(x)
+def mmss(s):
+    m, sec = str(s).strip().replace(".", ":").split(":")
+    return int(m) * 60 + float(sec)
 
 
-# ---------- Load data (skips repeated header rows, tracks blocks) ----------
+# ================= Load =================
 df = pd.read_excel(FILE, header=None)
 if df.shape[1] == 1:
     df = df[0].astype(str).str.split(expand=True)
 df = df.iloc[:, :3]
 df.columns = ["tod", "t", "raw"]
-is_data = df["tod"].astype(str).str.match(r"^\d{1,2}:\d{2}:\d{2}")
-df["block"] = (~is_data).cumsum()
-df = df[is_data].copy()
-df["t"] = pd.to_numeric(df["t"], errors="coerce")
+df = df[df["tod"].astype(str).str.match(r"^\d{1,2}:\d{2}:\d{2}")].copy()   # drop header rows
 df["raw"] = pd.to_numeric(df["raw"], errors="coerce")
-df = df.dropna(subset=["t", "raw"])
-df["tod_s"] = df["tod"].apply(to_sec)
+df["t"] = pd.to_numeric(df["t"], errors="coerce")
+df = df.dropna(subset=["t", "raw"]).reset_index(drop=True)
 
 
-# ---------- Cut out one throw: filter its block, keep only start -> start + duration ----------
-def get_throw(name, start, dur):
-    s = to_sec(start)
-    hit = df[df["tod_s"] >= s]
-    hit = hit[hit["tod_s"] <= s + dur]
-    if hit.empty:
-        raise ValueError(f"{name}: no data between {start} and +{dur}s")
-    g = df[df["block"] == hit["block"].iloc[0]].reset_index(drop=True)
-
-    fs = round(1 / np.median(np.diff(g["t"])))
-    x = g["raw"].to_numpy()
-    x = x - x.mean()                                            # remove DC offset
-    sos = butter(ORDER, [LOW, HIGH], btype="bandpass", fs=fs, output="sos")
-    y = sosfiltfilt(sos, x)
-
-    i0 = (g["tod_s"] >= s).idxmax()                             # first sample of the throw
-    t = g["t"].to_numpy() - g["t"].iloc[i0]
-    keep = (t >= 0) & (t < dur)
-    return dict(name=name, fs=fs, t=t[keep], raw=x[keep], filt=y[keep])
+def clock_s(s):
+    h, m, x = str(s).strip().split(":")
+    return int(h) * 3600 + int(m) * 60 + float(x)
 
 
-def spectrum(seg, fs):
-    f, p = welch(seg, fs=fs, nperseg=min(512, len(seg)))
-    return f, p
+x = df["raw"].to_numpy()
+d = np.diff(df["t"].to_numpy())
+fs = int(round(1 / np.median(d[d > 0])))
+
+# Labels are elapsed time on the WALL CLOCK. The file has gaps between recordings, so
+# locate each label by its clock time rather than by sample number.
+tod_s = df["tod"].apply(clock_s).to_numpy()
+t = tod_s - tod_s[0]                            # elapsed seconds, matching the labels
+print(f"{len(x)} samples at {fs} Hz = {len(x)/fs/60:.1f} min of data "
+      f"spread over {t[-1]/60:.1f} min of clock time (the difference is gaps)")
+print(f"Nyquist {fs/2:.0f} Hz")
+
+# ================= Filter =================
+x = x - x.mean()                                                      # 1. remove DC offset
+aa = min(AA_CUTOFF, 0.9 * fs / 2)                                     # keep below Nyquist
+x = sosfiltfilt(butter(4, aa, "lowpass", fs=fs, output="sos"), x)     # 2. anti-aliasing
+y = sosfiltfilt(butter(ORDER, [LOW, HIGH], "bandpass", fs=fs, output="sos"), x)   # 3. band-pass
+if NOTCH_60:                                                          # 4. mains notch
+    bn, an = iirnotch(60, Q=30, fs=fs)
+    y = filtfilt(bn, an, y)
+env = np.clip(sosfiltfilt(butter(4, ENV_HZ, "lowpass", fs=fs, output="sos"), np.abs(y)), 0, None)
+print(f"Filters: anti-aliasing {aa:.0f} Hz, band-pass {LOW}-{HIGH} Hz order {ORDER}"
+      + (", 60 Hz notch" if NOTCH_60 else ""))
 
 
-def features(seg, fs):
-    f, p = spectrum(seg, fs)
+# ================= Features =================
+def features(seg):
+    f, p = welch(seg, fs=fs, nperseg=min(1024, len(seg)))
     band = (f >= LOW) & (f <= HIGH)
     f, p = f[band], p[band]
     cum = np.cumsum(p)
-    mdf = f[np.searchsorted(cum, cum[-1] / 2)]                  # median frequency
-    mnf = np.sum(f * p) / np.sum(p)                             # mean power frequency
-    rms = np.sqrt(np.mean(seg ** 2))
-    return mdf, mnf, rms
+    mdf = f[np.searchsorted(cum, cum[-1] / 2)]      # median frequency
+    mnf = np.sum(f * p) / np.sum(p)                 # mean power frequency
+    return mdf, mnf, np.sqrt(np.mean(seg ** 2))     # plus RMS
 
 
-def sliding(seg, t, fs):
-    win, step = int(WIN_S * fs), int(STEP_S * fs)
-    out = [(t[i + win // 2], *features(seg[i:i + win], fs)[:2])
-           for i in range(0, len(seg) - win + 1, step)]
-    return list(zip(*out)) if out else ([], [], [])
+# ================= Part 1: analysis from the labels =================
+rows = []
+missing = []
+for name, s0, e0 in LABELS:
+    idx = np.where((t >= mmss(s0)) & (t <= mmss(e0)))[0]
+    if len(idx) < 256:
+        missing.append(f"{name} ({s0}-{e0}, {len(idx)} samples)")
+        continue
+    s, e = idx[0], idx[-1] + 1
+    mdf, mnf, rms = features(y[s:e])
+    rows.append(dict(event=name, kind="MVC" if "MVC" in name else "Throw",
+                     number=int(name.split()[-1]), start_s=round(mmss(s0), 1),
+                     duration_s=round(mmss(e0) - mmss(s0), 1),
+                     env_peak=env[s:e].max(), mdf_hz=mdf, mnf_hz=mnf, rms=rms))
+print(f"\n{len(rows)} of {len(LABELS)} labelled events have data in this file")
+if missing:
+    print(f"Not in the file ({len(missing)}), so left out of everything below:")
+    for m in missing:
+        print("  " + m)
+if not rows:
+    raise ValueError("None of the labelled times matched any data. Check that the label times "
+                     "are elapsed MM:SS from the start of the recording.")
+tab = pd.DataFrame(rows)
+mvc_rms = tab.loc[tab["kind"] == "MVC", "rms"].mean()
+tab["pct_mvc"] = tab["rms"] / mvc_rms * 100
+tab.to_csv("semg_labeled.csv", index=False)
+print("\n=== Features per labelled event ===")
+print(tab.round(2).to_string(index=False))
 
+th = tab[tab["kind"] == "Throw"]
+fits = {}
+print("\n=== Fatigue trend across throws (negative frequency slope = fatigue) ===")
+for c in ("mdf_hz", "mnf_hz", "pct_mvc"):
+    lr = linregress(th["number"], th[c])
+    fits[c] = lr
+    pct = lr.slope * (th["number"].max() - th["number"].min()) / th[c].iloc[0] * 100
+    print(f"  {c:8s}: {lr.slope:+.4g} per throw, p = {lr.pvalue:.4f}, "
+          f"R^2 = {lr.rvalue**2:.2f}, total change {pct:+.1f}%")
 
-throws = [get_throw(n, s, d) for n, (s, d) in THROWS.items()]
-a, b = throws
-
-for d in throws:
-    d["mdf"], d["mnf"], d["rms"] = features(d["filt"], d["fs"])
-    d["sl_t"], d["sl_mdf"], d["sl_mnf"] = sliding(d["filt"], d["t"], d["fs"])
-    print(f"{d['name']}: {d['fs']} Hz, {len(d['t'])} samples ({d['t'][-1]:.2f} s) | "
-          f"MDF {d['mdf']:.1f} Hz | MNF {d['mnf']:.1f} Hz | RMS {d['rms']:.4f}")
-
-# ---------- Comparison table + verdict ----------
-chg = {k: (b[k] - a[k]) / a[k] * 100 for k in ("mdf", "mnf", "rms")}
-table = pd.DataFrame(
-    {"Throw 1": [a["mdf"], a["mnf"], a["rms"]],
-     "Throw 2": [b["mdf"], b["mnf"], b["rms"]],
-     "Change (%)": [chg["mdf"], chg["mnf"], chg["rms"]]},
-    index=["MDF (Hz)", "MNF (Hz)", "RMS"],
-).round(3)
-print("\n" + table.to_string())
-table.to_csv("semg_throw_comparison.csv")
-
-if chg["mdf"] <= -DROP_PCT and chg["mnf"] <= -DROP_PCT:
-    verdict = "Fatigue-like shift: MDF and MNF both dropped" + \
-              (" and RMS rose." if chg["rms"] > 0 else ", but RMS did not rise.")
-elif chg["mdf"] < 0 and chg["mnf"] < 0:
-    verdict = "Small drop in MDF and MNF: possible fatigue, within the margin of noise."
-elif (chg["mdf"] < 0) != (chg["mnf"] < 0):
-    verdict = "MDF and MNF disagree: no clear fatigue evidence."
+down = fits["mdf_hz"].slope < 0 and fits["mnf_hz"].slope < 0
+sig = min(fits["mdf_hz"].pvalue, fits["mnf_hz"].pvalue) < 0.05
+if down and sig:
+    verdict = "Fatigue: MDF and MNF both fall significantly across throws"
+    verdict += " and amplitude rises." if fits["pct_mvc"].slope > 0 else ", but amplitude does not rise."
+elif down:
+    verdict = "Possible fatigue: MDF and MNF both fall, but not significantly (p > 0.05)."
+elif fits["mdf_hz"].slope < 0 or fits["mnf_hz"].slope < 0:
+    verdict = "Unclear: MDF and MNF disagree."
 else:
-    verdict = "No frequency drop: no sign of fatigue between these two throws."
-print("\nVerdict:", verdict)
-print("Note: two throws can't confirm fatigue, and rest between them can reverse it.")
+    verdict = "No fatigue signature: frequency did not fall across throws."
+print("\n" + verdict)
 
-# ---------- Figure 1: signals and spectra (same y-scale per row) ----------
-fig1, ax = plt.subplots(3, 2, figsize=(13, 10), sharey="row")
-for col, d in enumerate(throws):
-    c = COLORS[d["name"]]
-    ax[0, col].plot(d["t"], d["raw"], color=c, lw=0.7)
-    ax[0, col].set_title(f"{d['name']}: unfiltered")
-    ax[1, col].plot(d["t"], d["filt"], color=c, lw=0.7)
-    ax[1, col].set_title(f"{d['name']}: band-pass {LOW}-{HIGH} Hz")
-    for row in (0, 1):
-        ax[row, col].set_xlabel("Time (s)")
-    ax[2, col].semilogy(*spectrum(d["raw"], d["fs"]), color="gray", alpha=0.7, label="Unfiltered")
-    ax[2, col].semilogy(*spectrum(d["filt"], d["fs"]), color=c, label="Filtered")
-    ax[2, col].axvline(d["mdf"], color="black", ls="--", label=f"MDF {d['mdf']:.0f} Hz")
-    ax[2, col].axvline(d["mnf"], color="green", ls=":", label=f"MNF {d['mnf']:.0f} Hz")
-    ax[2, col].set_title(f"{d['name']}: spectrum")
-    ax[2, col].set_xlabel("Frequency (Hz)")
-    ax[2, col].legend()
-ax[0, 0].set_ylabel("Amplitude")
-ax[1, 0].set_ylabel("Amplitude")
-ax[2, 0].set_ylabel("Power")
-fig1.suptitle("Throw 1 vs Throw 2", fontsize=13)
+# ================= Part 2: detector scored against the labels =================
+# Generalizable rule: envelope peaks, spaced apart, above a level set by THIS recording.
+found = [(n, a, b) for n, a, b in LABELS
+         if ((t >= mmss(a)) & (t <= mmss(b))).sum() >= 256]
+label_mid = np.array([(mmss(a) + mmss(b)) / 2 for n, a, b in found])
+ref = np.median([env[(t >= mmss(a)) & (t <= mmss(b))].max() for n, a, b in found])
+print(f"\n=== Detector tuning (reference peak = median labelled peak = {ref:.4g}) ===")
+print("  sep_s  frac   found  hits  missed  false")
+
+best = None
+for sep in (5, 10, 15, 20):
+    for frac in (0.15, 0.25, 0.35, 0.5):
+        pk, _ = find_peaks(env, distance=int(sep * fs), height=frac * ref)
+        pt = t[pk]
+        hits = sum(np.any(np.abs(pt - m) <= TOL_S) for m in label_mid)
+        false = len(pt) - sum(np.any(np.abs(label_mid - p) <= TOL_S) for p in pt)
+        print(f"  {sep:<6} {frac:<6} {len(pt):<6} {hits:<5} {len(label_mid)-hits:<7} {false}")
+        score = hits - false
+        if best is None or score > best[0]:
+            best = (score, sep, frac, pk)
+
+_, sep, frac, pk = best
+print(f"\nBest: peaks at least {sep} s apart, above {frac:.0%} of the reference peak "
+      f"-> {len(pk)} detected, {sum(np.any(np.abs(t[pk]-m) <= TOL_S) for m in label_mid)}"
+      f"/{len(label_mid)} labels found")
+print("For another person, replace `ref` with their own MVC peak (or the median peak of their "
+      "strongest bursts) so the threshold scales to them.")
+
+# ================= Figures =================
+fig1, ax = plt.subplots(2, 1, sharex=True, figsize=(18, 7))
+step = max(1, fs // 50)
+ax[0].plot(t[::step], y[::step], color="gray", lw=0.4)
+ax[1].plot(t[::step], env[::step], color="black", lw=0.8)
+ax[1].axhline(frac * ref, color="green", ls="--", label=f"Detector level ({frac:.0%} of reference)")
+ymax = env.max()
+for name, s0, e0 in found:                      # only events that have data in the file
+    c = "tab:red" if "MVC" in name else "tab:blue"
+    for a in ax:
+        a.axvspan(mmss(s0), mmss(e0), color=c, alpha=0.3)
+    ax[1].text((mmss(s0) + mmss(e0)) / 2, ymax * 1.02,
+               name.replace("Throw ", "T"), ha="center", va="bottom",
+               fontsize=7, rotation=90, color=c)
+ax[1].set_ylim(0, ymax * 1.25)
+ax[1].plot(t[pk], env[pk], "kx", ms=6, label="Auto-detected peak")
+ax[0].set_title("Filtered sEMG with labelled events (blue = throw, red = MVC)")
+ax[0].set_ylabel("Amplitude")
+ax[1].set_title("Envelope, labels, and auto-detected peaks")
+ax[1].set_xlabel("Time from start of recording (s)")
+ax[1].set_ylabel("Envelope")
+ax[1].legend(loc="upper right")
 fig1.tight_layout()
+fig1.savefig("semg_labeled.png", dpi=150)
 
-# ---------- Figure 2: MDF / MNF over time, plus summary bars ----------
-fig2, a2 = plt.subplots(1, 3, figsize=(16, 5), gridspec_kw={"width_ratios": [1, 1, 0.8]})
-vals = [v for d in throws for v in (*d["sl_mdf"], *d["sl_mnf"], d["mdf"], d["mnf"])]
-lo, hi = min(vals) * 0.9, max(vals) * 1.1
-
-for k, d in enumerate(throws):
-    a2[k].plot(d["sl_t"], d["sl_mdf"], marker="o", color="tab:purple", label="MDF")
-    a2[k].plot(d["sl_t"], d["sl_mnf"], marker="s", color="tab:orange", label="MNF")
-    a2[k].axhline(d["mdf"], color="tab:purple", ls="--", alpha=0.5)
-    a2[k].axhline(d["mnf"], color="tab:orange", ls="--", alpha=0.5)
-    a2[k].set_ylim(lo, hi)
-    a2[k].set_title(f"{d['name']}: MDF and MNF over time")
-    a2[k].set_xlabel("Time within throw (s)")
-    a2[k].set_ylabel("Frequency (Hz)")
-    a2[k].legend()
-
-x, w = np.arange(2), 0.35
-for off, d in ((-w / 2, a), (w / 2, b)):
-    bars = a2[2].bar(x + off, [d["mdf"], d["mnf"]], w, color=COLORS[d["name"]], label=d["name"])
-    a2[2].bar_label(bars, fmt="%.1f")
-a2[2].set_xticks(x)
-a2[2].set_xticklabels(["MDF", "MNF"])
-a2[2].set_ylabel("Frequency (Hz)")
-a2[2].set_title("Summary")
-a2[2].legend()
+fig2, a2 = plt.subplots(1, 3, figsize=(15, 4.5))
+for a, c, title, unit in [(a2[0], "mdf_hz", "Median frequency (MDF)", "Hz"),
+                          (a2[1], "mnf_hz", "Mean power frequency (MNF)", "Hz"),
+                          (a2[2], "pct_mvc", "Amplitude", "% of MVC")]:
+    a.plot(th["number"], th[c], "o-", color="tab:blue")
+    xs = th["number"].to_numpy()
+    a.plot(xs, fits[c].intercept + fits[c].slope * xs, "r--",
+           label=f"{fits[c].slope:+.3g}/throw (p={fits[c].pvalue:.3f})")
+    a.legend()
+    a.set_title(title)
+    a.set_xlabel("Throw number")
+    a.set_ylabel(unit)
+fig2.suptitle(verdict)
 fig2.tight_layout()
-
-fig1.savefig("semg_fig1.png", dpi=150)
-fig2.savefig("semg_fig2.png", dpi=150)
+fig2.savefig("semg_fatigue.png", dpi=150)
 plt.show()
